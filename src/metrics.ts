@@ -40,8 +40,8 @@ import { getScoresDirect } from './snapshot-score-wrapper';
 // File paths for metric data
 const DATA_DIR = './data';
 const VOTING_METRICS_FILE_SCHEMA_VERSION = 2;
-const DISTRIBUTION_METRICS_FILE_SCHEMA_VERSION = 7;
-const DISTRIBUTION_METRICS_HISTORY_FILE_SCHEMA_VERSION = 2;
+const DISTRIBUTION_METRICS_FILE_SCHEMA_VERSION = 8;
+const DISTRIBUTION_METRICS_HISTORY_FILE_SCHEMA_VERSION = 3;
 const HISTORY_FILE_NAME = 'distributionMetricsHistory.json';
 const HISTORY_FILE_PATH = path.join(DATA_DIR, HISTORY_FILE_NAME);
 const baseBlockNumberCache = new Map<number, bigint>();
@@ -120,7 +120,7 @@ class MetricsManager<T> {
     
     // Ensure data directory exists
     if (!fs.existsSync(DATA_DIR)) {
-      console.log(`Creating data directory ${DATA_DIR}`);
+      console.log(`Creating ${filename} directory ${DATA_DIR}`);
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
 
@@ -1036,11 +1036,12 @@ async function calculateDistributionMetricsAtTimestamp(
   const daoTreasuryLocked = totalVestingAmount === 0n ? toTokenNumber(supCorpTreasuryBalanceWei as bigint) : toTokenNumber(totalVestingAmount);
   const daoTreasury = daoTreasuryUnlocked + daoTreasuryLocked;
 
-  // Query instant unlock events from SUP subgraph
+  // Query instant unlock events from SUP subgraph.
   console.log('Fetching instant unlock events...');
   const instantUnlocks = await queryAllPages<{
     locker: { id: string };
     netAmount: bigint;
+    penaltyAmount: bigint;
   }>(
     (lastId) => `{
       instantUnlocks(
@@ -1057,22 +1058,23 @@ async function calculateDistributionMetricsAtTimestamp(
           id
         }
         netAmount
+        penaltyAmount
       }
     }`,
     (res) => res.data.data.instantUnlocks,
     (item) => ({
       locker: { id: item.locker.id },
-      netAmount: BigInt(item.netAmount)
+      netAmount: BigInt(item.netAmount),
+      penaltyAmount: BigInt(item.penaltyAmount)
     }),
     config.supSubgraphUrl
   );
 
-  // Sum up netAmount values (the 20% that recipients actually received)
   const totalInstantUnlockedWei = instantUnlocks.reduce((sum, unlock) => sum + unlock.netAmount, 0n);
+  const totalInstantPenaltyWei = instantUnlocks.reduce((sum, unlock) => sum + unlock.penaltyAmount, 0n);
   const instantUnlocked = toTokenNumber(totalInstantUnlockedWei);
-  const tax = toTokenNumber(totalInstantUnlockedWei * BigInt(4));
 
-  // Count distinct lockers that performed instant unlocks
+  // Count distinct lockers that performed instant unlocks.
   const distinctLockers = new Set(instantUnlocks.map(unlock => unlock.locker.id.toLowerCase()));
   const reservesWithInstantUnlock = distinctLockers.size;
 
@@ -1123,6 +1125,7 @@ async function calculateDistributionMetricsAtTimestamp(
     locker: { id: string };
     recipient: string;
     unlockAmount: string;
+    netUnlockAmount: string;
     unlockPeriod: string;
     blockTimestamp: string;
     endDate: string;
@@ -1144,6 +1147,7 @@ async function calculateDistributionMetricsAtTimestamp(
         }
         recipient
         unlockAmount
+        netUnlockAmount
         unlockPeriod
         blockTimestamp
         endDate
@@ -1156,6 +1160,7 @@ async function calculateDistributionMetricsAtTimestamp(
       locker: { id: item.locker.id },
       recipient: item.recipient,
       unlockAmount: item.unlockAmount,
+      netUnlockAmount: item.netUnlockAmount,
       unlockPeriod: item.unlockPeriod,
       blockTimestamp: item.blockTimestamp,
       endDate: item.endDate,
@@ -1168,49 +1173,53 @@ async function calculateDistributionMetricsAtTimestamp(
 
   let totalStreamingOut = 0n;
   let totalStreamUnlocked = 0n;
+  let totalVestUnlockCharge = 0n;
 
   for (const fontaine of fontaines) {
     const fontaineBlockTimestamp = parseInt(fontaine.blockTimestamp, 10);
     const endDate = parseInt(fontaine.endDate, 10);
-    const unlockAmount = BigInt(fontaine.unlockAmount);
+    const grossUnlockAmount = BigInt(fontaine.unlockAmount);
+    const netUnlockAmount = BigInt(fontaine.netUnlockAmount);
     const unlockFlowRate = BigInt(fontaine.unlockFlowRate);
 
-    // Verification check: unlockFlowRate * (endDate - blockTimestamp) == unlockAmount
-    const expectedUnlockAmount = unlockFlowRate * BigInt(endDate - fontaineBlockTimestamp);
-    // unlockAmount can be slightly larger due to rounding, but not more than 1 second of unlockFlowRate
-    if (unlockAmount < expectedUnlockAmount || unlockAmount - expectedUnlockAmount > unlockFlowRate) {
+    const expectedNetUnlockAmount = unlockFlowRate * BigInt(endDate - fontaineBlockTimestamp);
+    if (netUnlockAmount !== expectedNetUnlockAmount) {
       throw new Error(
         `Fontaine ${fontaine.id} verification failed: ` +
-        `unlockFlowRate * (endDate - blockTimestamp) = ${expectedUnlockAmount.toString()} != unlockAmount = ${unlockAmount.toString()}, unlockFlowRate = ${unlockFlowRate.toString()}`
+        `unlockFlowRate * (endDate - blockTimestamp) = ${expectedNetUnlockAmount.toString()} != netUnlockAmount = ${netUnlockAmount.toString()}, unlockFlowRate = ${unlockFlowRate.toString()}`
       );
     }
+    if (grossUnlockAmount < netUnlockAmount) {
+      throw new Error(
+        `Fontaine ${fontaine.id} has netUnlockAmount ${netUnlockAmount.toString()} > unlockAmount ${grossUnlockAmount.toString()}`
+      );
+    }
+    totalVestUnlockCharge += grossUnlockAmount - netUnlockAmount;
 
-    // Throw error if snapshot timestamp is before fontaine started
     if (timestamp < fontaineBlockTimestamp) {
       throw new Error(
         `Snapshot timestamp ${timestamp} is before fontaine ${fontaine.id} blockTimestamp ${fontaineBlockTimestamp}`
       );
     }
 
-    // Calculate how much has been streamed
     let streamed: bigint;
     if (timestamp >= endDate) {
-      // Fully streamed
-      streamed = unlockAmount;
+      streamed = netUnlockAmount;
     } else {
-      // Partially streamed
       const timeElapsed = BigInt(timestamp - fontaineBlockTimestamp);
-      streamed = unlockFlowRate * timeElapsed;
+      const streamedAtRate = unlockFlowRate * timeElapsed;
+      streamed = streamedAtRate > netUnlockAmount ? netUnlockAmount : streamedAtRate;
     }
 
-    const remaining = unlockAmount - streamed;
+    const remaining = netUnlockAmount - streamed;
     totalStreamingOut += remaining;
     totalStreamUnlocked += streamed;
   }
 
   const streamingOut = toTokenNumber(totalStreamingOut);
   const streamUnlocked = toTokenNumber(totalStreamUnlocked);
-  console.log(`  Calculated streamingOut: ${streamingOut}, streamUnlocked: ${streamUnlocked}`);
+  const tax = toTokenNumber(totalInstantPenaltyWei + totalVestUnlockCharge);
+  console.log(`  Calculated streamingOut: ${streamingOut}, streamUnlocked: ${streamUnlocked}, tax: ${tax}`);
 
   const lockerBalances = reserveBalances - (stakedSup + lpSup + streamingOut + instantUnlocked + streamUnlocked + tax);
 
@@ -2039,53 +2048,51 @@ async function fetchDistributionMetrics(): Promise<DistributionMetrics> {
       });
     }
 
-    // Query transfer instantUnlockEvents to stakingRewardController for instant-unlock detection
-    console.log('Fetching transfer instantUnlockEvents to stakingRewardController...');
-    const transferEvents = await queryAllPages(
+    // Query explicit instant unlock entities. Locker -> controller transfers also include
+    // vest-unlock charges, so transfer destination alone cannot identify instant unlocks.
+    console.log('Fetching instant unlock events...');
+    const instantUnlocks = await queryAllPages<{
+      locker: { id: string };
+      netAmount: string;
+      penaltyAmount: string;
+    }>(
       (lastId) => `{
-        transferEvents(
+        instantUnlocks(
           first: 1000,
-          where: {
-            token: "${config.baseTokenAddress.toLowerCase()}",
-            to: "${config.stakingRewardControllerAddress.toLowerCase()}",
-            id_gt: "${lastId}"
-          },
+          where: { id_gt: "${lastId}" }
           orderBy: id,
           orderDirection: asc
         ) {
           id
-          from {
+          locker {
             id
           }
-          value
-          timestamp
+          netAmount
+          penaltyAmount
         }
       }`,
-      (res) => res.data.data.transferEvents,
-      (item) => item,
-      config.sfSubgraphUrl
+      (res) => res.data.data.instantUnlocks,
+      (item) => ({
+        locker: { id: item.locker.id },
+        netAmount: item.netAmount,
+        penaltyAmount: item.penaltyAmount
+      }),
+      config.supSubgraphUrl
     );
 
-    console.log(`Found ${transferEvents.length} transfer instantUnlockEvents to stakingRewardController`);
-
-    // Build a map of locker -> transfer instantUnlockEvents (only for lockers that exist)
-    const lockerAddressesSet = new Set(lockers.map(l => l.toLowerCase()));
-    const instantUnlockEventsByLocker = new Map<string, Array<{ value: bigint; timestamp: number }>>();
-    
-    transferEvents.forEach(event => {
-      const fromAddress = event.from.id.toLowerCase();
-      if (lockerAddressesSet.has(fromAddress)) {
-        if (!instantUnlockEventsByLocker.has(fromAddress)) {
-          instantUnlockEventsByLocker.set(fromAddress, []);
-        }
-        instantUnlockEventsByLocker.get(fromAddress)!.push({
-          value: BigInt(event.value),
-          timestamp: parseInt(event.timestamp, 10)
-        });
+    const instantUnlocksByLocker = new Map<string, Array<{ netAmount: bigint; penaltyAmount: bigint }>>();
+    instantUnlocks.forEach(unlock => {
+      const lockerId = unlock.locker.id.toLowerCase();
+      if (!instantUnlocksByLocker.has(lockerId)) {
+        instantUnlocksByLocker.set(lockerId, []);
       }
+      instantUnlocksByLocker.get(lockerId)!.push({
+        netAmount: BigInt(unlock.netAmount),
+        penaltyAmount: BigInt(unlock.penaltyAmount)
+      });
     });
 
-    console.log(`Found ${instantUnlockEventsByLocker.size} lockers with instant-unlock instantUnlockEvents`);
+    console.log(`Found ${instantUnlocks.length} instant unlock events from ${instantUnlocksByLocker.size} lockers`);
 
     // Calculate streaming out by querying fontaines from sup_subgraph
     console.log('Fetching fontaines...');
@@ -2103,7 +2110,11 @@ async function fetchDistributionMetrics(): Promise<DistributionMetrics> {
           }
           recipient
           unlockAmount
+          netUnlockAmount
           unlockPeriod
+          blockTimestamp
+          endDate
+          unlockFlowRate
         }
       }`,
       (res) => res.data.data.fontaines,
@@ -2126,25 +2137,46 @@ async function fetchDistributionMetrics(): Promise<DistributionMetrics> {
 
     const fontaineBalances = await Promise.all(fontaineBalancePromises);
     
-    // Map fontaine balances to lockers and calculate stream unlocks
+    // Map Fontaine balances to lockers. The onchain balance remains authoritative for
+    // SUP still held by the Fontaine; streamed accounting uses the indexed net principal.
     fontaines.forEach((fontaine, idx) => {
       const lockerId = fontaine.locker.id.toLowerCase();
       const balance = fontaineBalances[idx] as bigint;
-      const unlockAmount = BigInt(fontaine.unlockAmount);
-      const unlockPeriod = parseInt(fontaine.unlockPeriod, 10);
-      
-      // Log if unlockPeriod is different from the expected 12 months. Only for those the assumption of 0 tax holds
-      if (unlockPeriod !== 31536000) {
-        console.log(`Warning: Fontaine ${fontaine.id} has unlockPeriod ${unlockPeriod} (expected 31536000)`);
+      const grossUnlockAmount = BigInt(fontaine.unlockAmount);
+      const netUnlockAmount = BigInt(fontaine.netUnlockAmount);
+      const unlockFlowRate = BigInt(fontaine.unlockFlowRate);
+      const fontaineBlockTimestamp = parseInt(fontaine.blockTimestamp, 10);
+      const endDate = parseInt(fontaine.endDate, 10);
+
+      const expectedNetUnlockAmount = unlockFlowRate * BigInt(endDate - fontaineBlockTimestamp);
+      if (netUnlockAmount !== expectedNetUnlockAmount) {
+        throw new Error(
+          `Fontaine ${fontaine.id} verification failed: ` +
+          `unlockFlowRate * (endDate - blockTimestamp) = ${expectedNetUnlockAmount.toString()} != netUnlockAmount = ${netUnlockAmount.toString()}`
+        );
       }
-      
+      if (grossUnlockAmount < netUnlockAmount) {
+        throw new Error(`Fontaine ${fontaine.id} has netUnlockAmount ${netUnlockAmount} > unlockAmount ${grossUnlockAmount}`);
+      }
+      if (balance > grossUnlockAmount) {
+        throw new Error(`Fontaine ${fontaine.id} has balance ${balance} > unlockAmount ${grossUnlockAmount}`);
+      }
+
+      let streamed: bigint;
+      if (currentTimestamp <= fontaineBlockTimestamp) {
+        streamed = 0n;
+      } else if (currentTimestamp >= endDate) {
+        streamed = netUnlockAmount;
+      } else {
+        const streamedAtRate = unlockFlowRate * BigInt(currentTimestamp - fontaineBlockTimestamp);
+        streamed = streamedAtRate > netUnlockAmount ? netUnlockAmount : streamedAtRate;
+      }
+
       const locker = lockerMap.get(lockerId);
       if (locker) {
         locker.fontaines += balance;
-        if (balance > unlockAmount) {
-          throw new Error(`Fontaine ${fontaine.id} has balance ${balance} > unlockAmount ${unlockAmount}`);
-        }
-        locker.streamUnlocked += unlockAmount - balance;
+        locker.streamUnlocked += streamed;
+        locker.tax += grossUnlockAmount - netUnlockAmount;
       } else {
         throw new Error(`Fontaine ${fontaine.id} - owning locker ${lockerId} not found in lockerMap`);
       }
@@ -2169,14 +2201,12 @@ async function fetchDistributionMetrics(): Promise<DistributionMetrics> {
     let reservesWithNone = 0;
 
     lockerMap.forEach((data, address) => {
-      // Process instant unlock instantUnlockEvents for this locker
-      const instantUnlockEvents = instantUnlockEventsByLocker.get(address);
-      if (instantUnlockEvents) {
-        instantUnlockEvents.forEach(event => {
-          // 20% is unlocked, 80% goes to tax
-          const unlocked = event.value / BigInt(4); // 1/4 of 80% is 20%
-          data.instantUnlocked += unlocked;
-          data.tax += event.value; // 80% of value
+      // Process explicit instant unlock records for this locker.
+      const lockerInstantUnlocks = instantUnlocksByLocker.get(address);
+      if (lockerInstantUnlocks) {
+        lockerInstantUnlocks.forEach(unlock => {
+          data.instantUnlocked += unlock.netAmount;
+          data.tax += unlock.penaltyAmount;
         });
       }
 
